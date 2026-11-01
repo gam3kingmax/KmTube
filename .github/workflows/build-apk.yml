@@ -72,8 +72,8 @@ jobs:
                   applicationId 'com.snapgrab.app'
                   minSdk 29
                   targetSdk 34
-                  versionCode 2
-                  versionName '2.0'
+                  versionCode 3
+                  versionName '2.1'
                   ndk {
                       abiFilters 'arm64-v8a', 'armeabi-v7a'
                   }
@@ -227,6 +227,7 @@ jobs:
 
               private static final int[] WANTED = {240, 360, 480, 720, 1080};
               private static final int REQ_TREE = 1001;
+              private static final String UPDATING = "Updating download engine...";
 
               private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
               private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
@@ -251,6 +252,7 @@ jobs:
               private Button searchBtn;
               private Button changeBtn;
               private Button resetBtn;
+              private Button updateBtn;
               private LinearLayout resultCard;
               private TextView titleView;
               private TextView metaView;
@@ -277,6 +279,11 @@ jobs:
                           FFmpeg.getInstance().init(getApplication());
                       } catch (Exception e) {
                           initError = String.valueOf(e);
+                          return;
+                      }
+                      long last = prefs.getLong("lastUpdate", 0L);
+                      if (System.currentTimeMillis() - last > 24L * 60 * 60 * 1000) {
+                          doUpdate(false);
                       }
                   });
 
@@ -453,6 +460,10 @@ jobs:
                   progressBox.addView(progressBar, lp(MATCH, dp(10), 8));
                   resultCard.addView(progressBox, lp(MATCH, WRAP, 16));
 
+                  // Update button
+                  updateBtn = makeButton("Update download engine", false);
+                  root.addView(updateBtn, lp(MATCH, WRAP, 16));
+
                   // Actions
                   pasteBtn.setOnClickListener(v -> {
                       ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -477,6 +488,13 @@ jobs:
                       prefs.edit().remove("tree").apply();
                       updateDest();
                   });
+                  updateBtn.setOnClickListener(v -> {
+                      setBusy(true);
+                      bg.execute(() -> {
+                          doUpdate(true);
+                          setBusy(false);
+                      });
+                  });
               }
 
               private void setStatus(String msg, boolean error) {
@@ -489,6 +507,113 @@ jobs:
                   status.setText(msg);
                   status.setTextColor(GREEN);
                   status.setVisibility(View.VISIBLE);
+              }
+
+              // ---------- Engine update ----------
+
+              private Object pickChannel(Class<?> c) {
+                  try {
+                      Object o = c.getField("_STABLE").get(null);
+                      if (o != null) return o;
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Object o = c.getField("STABLE").get(null);
+                      if (o != null) return o;
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      return Class.forName(c.getName() + "$STABLE").getField("INSTANCE").get(null);
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Object[] cs = c.getEnumConstants();
+                      if (cs != null) {
+                          for (Object o : cs) {
+                              if (o.toString().equals("STABLE")) return o;
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  return null;
+              }
+
+              private String updateEngine() throws Exception {
+                  Exception lastErr = null;
+                  for (Method m : YoutubeDL.class.getMethods()) {
+                      if (!m.getName().equals("updateYoutubeDL")) continue;
+                      Class<?>[] pt = m.getParameterTypes();
+                      Object[] args = new Object[pt.length];
+                      for (int i = 0; i < pt.length; i++) {
+                          if (pt[i].isAssignableFrom(getApplication().getClass())) {
+                              args[i] = getApplication();
+                          } else {
+                              args[i] = pickChannel(pt[i]);
+                          }
+                      }
+                      try {
+                          Object r = m.invoke(YoutubeDL.getInstance(), args);
+                          return String.valueOf(r);
+                      } catch (InvocationTargetException e) {
+                          Throwable c = e.getCause();
+                          lastErr = (c instanceof Exception) ? (Exception) c : e;
+                      } catch (Exception e) {
+                          lastErr = e;
+                      }
+                  }
+                  if (lastErr != null) throw lastErr;
+                  throw new RuntimeException("This engine version cannot be updated inside the app.");
+              }
+
+              private void doUpdate(boolean manual) {
+                  runOnUiThread(() -> setStatus(UPDATING, false));
+                  try {
+                      String r = updateEngine();
+                      prefs.edit().putLong("lastUpdate", System.currentTimeMillis()).apply();
+                      final String msg = r.toUpperCase().contains("ALREADY")
+                              ? "Download engine is already up to date."
+                              : "Download engine updated. Try your link again.";
+                      runOnUiThread(() -> {
+                          if (manual) {
+                              setStatusOk(msg);
+                          } else if (status.getText().toString().equals(UPDATING)) {
+                              setStatus("", false);
+                          }
+                      });
+                  } catch (Exception e) {
+                      final String m = cleanError(String.valueOf(e.getMessage()));
+                      runOnUiThread(() -> {
+                          if (manual) {
+                              setStatus("Update failed: " + m, true);
+                          } else if (status.getText().toString().equals(UPDATING)) {
+                              setStatus("", false);
+                          }
+                      });
+                  }
+              }
+
+              private String cleanError(String raw) {
+                  if (raw == null) return "Unknown error";
+                  StringBuilder kept = new StringBuilder();
+                  for (String line : raw.split("\n")) {
+                      String t = line.trim();
+                      if (t.isEmpty()) continue;
+                      if (t.startsWith("WARNING: Your yt-dlp version")) continue;
+                      if (t.startsWith("It is strongly recommended")) continue;
+                      if (t.startsWith("Run \"yt-dlp")) continue;
+                      if (t.startsWith("To suppress this warning")) continue;
+                      kept.append(t.replace("ERROR: ", "").replace("WARNING: ", "")).append(' ');
+                  }
+                  String out = kept.length() > 0 ? kept.toString().trim() : raw.trim();
+                  if (out.length() > 350) out = out.substring(0, 350) + "...";
+                  String low = raw.toLowerCase();
+                  if (low.contains("login") || low.contains("cookies")
+                          || low.contains("empty media response") || low.contains("rate-limit")) {
+                      out += "\n\nThis link seems to need a logged-in session. Public posts usually work "
+                              + "after updating the engine. Private or login-only posts need cookies, "
+                              + "which this app does not support yet.";
+                  }
+                  return out;
               }
 
               // ---------- Destination folder ----------
@@ -550,7 +675,7 @@ jobs:
               private void setBusy(boolean busy) {
                   runOnUiThread(() -> {
                       float alpha = busy ? 0.5f : 1f;
-                      Button[] all = {searchBtn, pasteBtn, changeBtn, resetBtn};
+                      Button[] all = {searchBtn, pasteBtn, changeBtn, resetBtn, updateBtn};
                       for (Button x : all) {
                           x.setEnabled(!busy);
                           x.setAlpha(alpha);
@@ -632,9 +757,8 @@ jobs:
                               resultCard.setVisibility(View.VISIBLE);
                           });
                       } catch (Exception e) {
-                          final String msg = String.valueOf(e.getMessage());
-                          runOnUiThread(() -> setStatus("Could not read this link: "
-                                  + msg.substring(0, Math.min(300, msg.length())), true));
+                          final String msg = cleanError(String.valueOf(e.getMessage()));
+                          runOnUiThread(() -> setStatus("Could not read this link: " + msg, true));
                       }
                       setBusy(false);
                   });
@@ -755,11 +879,10 @@ jobs:
                           showProgress(100, "Done  100%");
                           runOnUiThread(() -> setStatusOk("Saved to " + where + "\n" + name));
                       } catch (Exception e) {
-                          final String msg = String.valueOf(e.getMessage());
+                          final String msg = cleanError(String.valueOf(e.getMessage()));
                           runOnUiThread(() -> {
                               progressBox.setVisibility(View.GONE);
-                              setStatus("Download failed: "
-                                      + msg.substring(0, Math.min(300, msg.length())), true);
+                              setStatus("Download failed: " + msg, true);
                           });
                       } finally {
                           deleteRecursive(dir);
