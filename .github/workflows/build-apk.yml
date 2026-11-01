@@ -341,4 +341,142 @@ jobs:
                               addOption("Best quality video (MP4)", url, false, -1);
                               addOption("Audio only (MP3)", url, true, -1);
                           });
-                      } catch (Exception e)
+                      } catch (Exception e) {
+                          final String msg = String.valueOf(e.getMessage());
+                          runOnUiThread(() -> status.setText("Could not read this link: "
+                                  + msg.substring(0, Math.min(300, msg.length()))));
+                      }
+                      setBusy(false);
+                  });
+              }
+
+              private void addOption(String label, String url, boolean audio, int height) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setOnClickListener(v -> download(url, audio, height));
+                  options.addView(b, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+              }
+
+              private void download(String url, boolean audio, int height) {
+                  setBusy(true);
+                  status.setText("Downloading... keep the app open. This can take a few minutes.");
+
+                  bg.execute(() -> {
+                      File dir = new File(getExternalFilesDir(null), "dl" + System.currentTimeMillis());
+                      try {
+                          dir.mkdirs();
+                          YoutubeDLRequest req = new YoutubeDLRequest(url);
+                          req.addOption("--no-playlist");
+                          req.addOption("--restrict-filenames");
+                          req.addOption("-o", dir.getAbsolutePath() + "/%(title).60s.%(ext)s");
+
+                          if (audio) {
+                              req.addOption("-f", "ba/b");
+                              req.addOption("-x");
+                              req.addOption("--audio-format", "mp3");
+                          } else {
+                              String f;
+                              if (height > 0) {
+                                  f = "bv*[height<=" + height + "][ext=mp4]+ba[ext=m4a]"
+                                          + "/bv*[height<=" + height + "]+ba"
+                                          + "/b[height<=" + height + "]/b";
+                              } else {
+                                  f = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b";
+                              }
+                              req.addOption("-f", f);
+                              req.addOption("--merge-output-format", "mp4");
+                          }
+
+                          YoutubeDL.getInstance().execute(req);
+
+                          File out = pickOutput(dir);
+                          if (out == null) {
+                              throw new RuntimeException("No file was produced");
+                          }
+                          saveToDownloads(out);
+                          final String name = out.getName();
+                          runOnUiThread(() -> status.setText(
+                                  "Done! Saved to Downloads/SnapGrab:\n" + name));
+                      } catch (Exception e) {
+                          final String msg = String.valueOf(e.getMessage());
+                          runOnUiThread(() -> status.setText("Download failed: "
+                                  + msg.substring(0, Math.min(300, msg.length()))));
+                      } finally {
+                          deleteRecursive(dir);
+                          setBusy(false);
+                      }
+                  });
+              }
+
+              private File pickOutput(File dir) {
+                  File[] files = dir.listFiles();
+                  if (files == null) return null;
+                  File best = null;
+                  for (File f : files) {
+                      String n = f.getName();
+                      if (n.endsWith(".part") || n.endsWith(".ytdl")) continue;
+                      if (best == null || f.length() > best.length()) best = f;
+                  }
+                  return best;
+              }
+
+              private String mimeFor(String name) {
+                  String n = name.toLowerCase();
+                  if (n.endsWith(".mp4")) return "video/mp4";
+                  if (n.endsWith(".mp3")) return "audio/mpeg";
+                  if (n.endsWith(".m4a")) return "audio/mp4";
+                  if (n.endsWith(".webm")) return "video/webm";
+                  if (n.endsWith(".mkv")) return "video/x-matroska";
+                  return "application/octet-stream";
+              }
+
+              private void saveToDownloads(File src) throws Exception {
+                  ContentValues values = new ContentValues();
+                  values.put(MediaStore.Downloads.DISPLAY_NAME, src.getName());
+                  values.put(MediaStore.Downloads.MIME_TYPE, mimeFor(src.getName()));
+                  values.put(MediaStore.Downloads.RELATIVE_PATH, "Download/SnapGrab");
+
+                  Uri uri = getContentResolver().insert(
+                          MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                  if (uri == null) {
+                      throw new RuntimeException("Could not create file in Downloads");
+                  }
+                  try (InputStream in = new FileInputStream(src);
+                       OutputStream out = getContentResolver().openOutputStream(uri)) {
+                      byte[] buf = new byte[64 * 1024];
+                      int n;
+                      while ((n = in.read(buf)) > 0) {
+                          out.write(buf, 0, n);
+                      }
+                  }
+              }
+
+              private void deleteRecursive(File f) {
+                  File[] kids = f.listFiles();
+                  if (kids != null) {
+                      for (File k : kids) deleteRecursive(k);
+                  }
+                  f.delete();
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk SnapGrab.apk
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapGrab-apk
+          path: SnapGrab.apk
+
+      - name: Publish release (easy download on phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: SnapGrab v${{ github.run_number }}
+          files: SnapGrab.apk
